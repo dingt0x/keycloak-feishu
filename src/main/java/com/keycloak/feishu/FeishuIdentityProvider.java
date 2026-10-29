@@ -11,6 +11,7 @@ import org.jboss.logging.Logger;
 import org.keycloak.broker.provider.AuthenticationRequest;
 import org.keycloak.broker.provider.BrokeredIdentityContext;
 import org.keycloak.broker.provider.IdentityBrokerException;
+import org.keycloak.broker.provider.UserAuthenticationIdentityProvider;
 import org.keycloak.broker.provider.IdentityProvider;
 import org.keycloak.broker.oidc.AbstractOAuth2IdentityProvider;
 import org.keycloak.broker.provider.util.SimpleHttp;
@@ -119,72 +120,100 @@ public class FeishuIdentityProvider extends AbstractOAuth2IdentityProvider<Feish
     // ========================================================================
 
     @Override
-    public Object callback(RealmModel realm, IdentityProvider.AuthenticationCallback callback,
+    public Object callback(RealmModel realm, UserAuthenticationIdentityProvider.AuthenticationCallback callback,
                            EventBuilder event) {
-        // Read parameters from both query string and form body
-        String code = getParameter("code");
-        String state = getParameter("state");
-        String error = getParameter("error");
+        // Must be a subclass of Keycloak's own Endpoint. Quarkus only indexes
+        // that class's @GET; a brand-new resource class in this jar is invisible
+        // at build time and the broker URL answers 405.
+        return new Endpoint(realm, callback, event);
+    }
 
-        if (error != null && !error.isEmpty()) {
-            logger.errorf("Feishu OAuth2 error received: %s", error);
-            String errorDescription = getParameter("error_description");
-            if (errorDescription != null) {
-                logger.errorf("Feishu OAuth2 error description: %s", errorDescription);
+    /**
+     * HTTP resource mounted at {@code /broker/{alias}/endpoint}.
+     * Inherits {@code @GET} from Keycloak's OAuth endpoint so the Feishu browser redirect is accepted.
+     */
+    public class Endpoint extends AbstractOAuth2IdentityProvider.Endpoint {
+        public Endpoint(RealmModel realm,
+                        UserAuthenticationIdentityProvider.AuthenticationCallback callback,
+                        EventBuilder event) {
+            super(callback, realm, event, FeishuIdentityProvider.this);
+        }
+
+        @Override
+        public Response authResponse(String state, String code, String error, String errorDescription) {
+            if (isBlank(state)) {
+                state = getParameter("state");
             }
-            return callback.error("Identity provider login failed: " + error);
+            if (isBlank(code)) {
+                code = getParameter("code");
+            }
+            if (isBlank(error)) {
+                error = getParameter("error");
+            }
+            if (isBlank(errorDescription)) {
+                errorDescription = getParameter("error_description");
+            }
+
+            if (!isBlank(error)) {
+                logger.errorf("Feishu OAuth2 error received: %s", error);
+                if (!isBlank(errorDescription)) {
+                    logger.errorf("Feishu OAuth2 error description: %s", errorDescription);
+                }
+                return callback.error(getConfig(), "Identity provider login failed: " + error);
+            }
+
+            if (isBlank(code)) {
+                logger.error("Feishu callback called without authorization code");
+                return callback.error(getConfig(), "Missing authorization code");
+            }
+
+            if (isBlank(state)) {
+                logger.error("Feishu callback called without state parameter");
+                return callback.error(getConfig(), "Missing state parameter");
+            }
+
+            org.keycloak.sessions.AuthenticationSessionModel authSession =
+                    callback.getAndVerifyAuthenticationSession(state);
+            if (authSession == null) {
+                logger.errorf("Failed to verify authentication session for state: %s", state);
+                return callback.error(getConfig(), "Invalid state parameter");
+            }
+
+            String redirectUri = getConfig().getAlias() != null
+                    ? session.getContext().getUri().getBaseUri()
+                        + "realms/" + realm.getName()
+                        + "/broker/" + getConfig().getAlias() + "/endpoint"
+                    : null;
+            String accessToken = exchangeCodeForAccessToken(code, redirectUri);
+            if (accessToken == null) {
+                logger.error("Failed to obtain access token from Feishu");
+                return callback.error(getConfig(), "Failed to obtain access token");
+            }
+
+            BrokeredIdentityContext identity = doGetFederatedIdentity(accessToken);
+            if (identity == null) {
+                logger.error("Failed to retrieve federated identity from Feishu");
+                return callback.error(getConfig(), "Failed to retrieve user identity");
+            }
+
+            identity.getContextData().put(FEDERATED_ACCESS_TOKEN, accessToken);
+            identity.setAuthenticationSession(authSession);
+            identity.setIdp(FeishuIdentityProvider.this);
+
+            // isStoreToken() returns Boolean and is null when the admin console
+            // never touched "Store tokens" — unboxing that NPEs the whole login.
+            if (Boolean.TRUE.equals(getConfig().isStoreToken()) && identity.getToken() == null) {
+                identity.setToken(accessToken);
+            }
+
+            migrateFederatedIdentityLink(realm, identity);
+
+            return callback.authenticated(identity);
         }
+    }
 
-        if (code == null || code.isEmpty()) {
-            logger.error("Feishu callback called without authorization code");
-            return callback.error("Missing authorization code");
-        }
-
-        // Validate the state and recover the authentication session
-        if (state == null || state.isEmpty()) {
-            logger.error("Feishu callback called without state parameter");
-            return callback.error("Missing state parameter");
-        }
-
-        org.keycloak.sessions.AuthenticationSessionModel authSession =
-                callback.getAndVerifyAuthenticationSession(state);
-        if (authSession == null) {
-            logger.errorf("Failed to verify authentication session for state: %s", state);
-            return callback.error("Invalid state parameter");
-        }
-
-        // Exchange the authorization code for an access token via Feishu's JSON API
-        String redirectUri = getConfig().getAlias() != null
-                ? session.getContext().getUri().getBaseUri()
-                    + "realms/" + realm.getName()
-                    + "/broker/" + getConfig().getAlias() + "/endpoint"
-                : null;
-        String accessToken = exchangeCodeForAccessToken(code, redirectUri);
-        if (accessToken == null) {
-            logger.error("Failed to obtain access token from Feishu");
-            return callback.error("Failed to obtain access token");
-        }
-
-        // Retrieve the federated identity using the access token
-        BrokeredIdentityContext identity = doGetFederatedIdentity(accessToken);
-        if (identity == null) {
-            logger.error("Failed to retrieve federated identity from Feishu");
-            return callback.error("Failed to retrieve user identity");
-        }
-
-        identity.getContextData().put(FEDERATED_ACCESS_TOKEN, accessToken);
-        identity.setAuthenticationSession(authSession);
-        identity.setIdp(this);
-
-        if (getConfig().isStoreToken() && identity.getToken() == null) {
-            identity.setToken(accessToken);
-        }
-
-        // Backward compatibility: if the broker user ID changed from open_id to union_id,
-        // migrate any existing federated link keyed by the legacy open_id.
-        migrateFederatedIdentityLink(realm, identity);
-
-        return callback.authenticated(identity);
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     /**
@@ -305,8 +334,40 @@ public class FeishuIdentityProvider extends AbstractOAuth2IdentityProvider<Feish
                 .header("Content-Type", "application/json; charset=utf-8");
 
         String response = http.asString();
-        logger.debug("Feishu user_info response received (body omitted for security)");
+        // FEISHU_DEBUG is off unless it is exactly "1" or "true". The body
+        // contains names, phones and emails, so any other value stays silent.
+        // The token response is never logged: it carries access_token.
+        if (isFeishuDebugEnabled(System.getenv("FEISHU_DEBUG"))) {
+            logger.infof("Feishu user_info response: %s", response);
+        } else {
+            logger.debug("Feishu user_info response received (body omitted for security)");
+        }
 
+        return unwrapUserInfoResponse(response);
+    }
+
+    /**
+     * Whether {@code FEISHU_DEBUG} asks for the raw {@code user_info} body.
+     *
+     * <p>Only {@code 1} and {@code true} (trimmed, case-insensitive) enable it.
+     * Missing, blank, and every other value stay off.</p>
+     */
+    static boolean isFeishuDebugEnabled(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String value = raw.trim();
+        return "1".equals(value) || "true".equalsIgnoreCase(value);
+    }
+
+    /**
+     * Parse a raw Feishu {@code user_info} response body and return the
+     * {@code data} payload, unwrapping the {@code {code, msg, data}} envelope.
+     *
+     * <p>Package-private and static so the envelope handling can be unit
+     * tested without a {@link KeycloakSession} or a live HTTP call.</p>
+     */
+    static JsonNode unwrapUserInfoResponse(String response) throws Exception {
         JsonNode root = mapper.readTree(response);
 
         // Check for Feishu API-level error
@@ -329,7 +390,7 @@ public class FeishuIdentityProvider extends AbstractOAuth2IdentityProvider<Feish
      * Build a {@link BrokeredIdentityContext} from the Feishu user_info
      * response data node.
      */
-    private BrokeredIdentityContext buildIdentity(JsonNode userInfo) {
+    BrokeredIdentityContext buildIdentity(JsonNode userInfo) {
         String openId = getField(userInfo, FLD_OPEN_ID);
         String unionId = getField(userInfo, FLD_UNION_ID);
         String sub = getField(userInfo, FLD_SUB);
@@ -379,7 +440,7 @@ public class FeishuIdentityProvider extends AbstractOAuth2IdentityProvider<Feish
     /**
      * Pick the best avatar URL: big > middle > thumb > url.
      */
-    private static String pickAvatar(JsonNode userInfo) {
+    static String pickAvatar(JsonNode userInfo) {
         String avatar = getField(userInfo, FLD_AVATAR_BIG);
         if (avatar != null) return avatar;
         avatar = getField(userInfo, FLD_AVATAR_MIDDLE);
@@ -392,7 +453,7 @@ public class FeishuIdentityProvider extends AbstractOAuth2IdentityProvider<Feish
     /**
      * Safe field accessor that handles missing, null, and empty-string values.
      */
-    private static String getField(JsonNode node, String field) {
+    static String getField(JsonNode node, String field) {
         if (node == null || !node.has(field) || node.get(field).isNull()) {
             return null;
         }

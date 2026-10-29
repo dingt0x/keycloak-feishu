@@ -15,7 +15,7 @@ custom proxy.
 
 ## Requirements
 
-- **Keycloak** 22+ (tested with Keycloak 25)
+- **Keycloak** 26.5+ (this fork is pinned to and tested against **26.8.1**)
 - **Java** 17+
 - **Apache Maven** 3.8+
 
@@ -124,7 +124,7 @@ and maps every field to a Keycloak user attribute.
 |-------------------|-------------------------|------------------------|------------------------------|
 | `union_id`        | broker user ID (preferred) | `feishu_union_id`      | Cross-app user identifier (used as federated ID when available) |
 | `open_id`         | broker user ID (fallback) | `feishu_open_id`       | Stable user identifier (fallback when union_id is missing) |
-| `name`            | firstName, username     | `feishu_name`          | Chinese display name         |
+| `name`            | firstName               | `feishu_name`          | Chinese display name (no separate surname field in Feishu) |
 | `en_name`         | —                       | `feishu_en_name`       | English name; stored as attribute only, not mapped to lastName or any profile field |
 | `email`           | email (if non-blank)    | `feishu_email`         | May be `""` — skipped if empty |
 | `mobile`          | —                       | `feishu_mobile`        | Phone number                 |

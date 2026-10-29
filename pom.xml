@@ -5,7 +5,7 @@
 
     <groupId>com.keycloak</groupId>
     <artifactId>keycloak-feishu</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0-kc26.8.1</version>
     <packaging>jar</packaging>
 
     <name>Keycloak Feishu IdP</name>
@@ -15,7 +15,7 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <keycloak.version>25.0.6</keycloak.version>
+        <keycloak.version>26.8.1</keycloak.version>
     </properties>
 
     <dependencies>
@@ -72,6 +72,19 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.3.0</version>
+            </plugin>
+            <plugin>
+                <groupId>io.smallrye</groupId>
+                <artifactId>jandex-maven-plugin</artifactId>
+                <version>3.2.3</version>
+                <executions>
+                    <execution>
+                        <id>make-index</id>
+                        <goals>
+                            <goal>jandex</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
